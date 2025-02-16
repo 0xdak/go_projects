@@ -26,7 +26,7 @@ func scan(host string, port int, wg *sync.WaitGroup) {
 	conn, err := net.Dial("tcp", host+":"+strconv.Itoa(port))
 	if err == nil {
 		fmt.Println("[+] Found open port:", port)
-		conn.Close()
+		defer conn.Close() // in a scenario like a panic, it will close the connection
 	}
 }
 
