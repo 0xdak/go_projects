@@ -20,12 +20,15 @@ var (
 	portStop  int = 0
 )
 
+var openPorts = make(chan int, 65535)
+
 func scan(host string, port int, wg *sync.WaitGroup) {
 	defer wg.Done()
 	// fmt.Println("[+] Checking open port:", port)
 	conn, err := net.Dial("tcp", host+":"+strconv.Itoa(port))
 	if err == nil {
 		fmt.Println("[+] Found open port:", port)
+		openPorts <- port
 		defer conn.Close() // in a scenario like a panic, it will close the connection
 	}
 }
@@ -60,5 +63,6 @@ func main() {
 		go scan(host, port, &wg)
 	}
 	wg.Wait()
-
+	close(openPorts)
+	fmt.Println("[+] Number of open ports:", len(openPorts))
 }
