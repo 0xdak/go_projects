@@ -5,6 +5,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -18,6 +19,7 @@ import (
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcap"
+	"github.com/mostlygeek/arp"
 	"github.com/phayes/freeport"
 )
 
@@ -111,12 +113,26 @@ func sendSynPacket(handle *pcap.Handle, host string, port int) {
 }
 
 func createSynPacket(handle *pcap.Handle, host string, port int, rawPort int) (gopacket.SerializeBuffer, error) {
+	networkInterface, err := net.InterfaceByName("en0")
+	if err != nil {
+		log.Fatal(err)
+	}
+	//@ToDo: find gateway ip
+	gateway := net.ParseIP("192.168.1.1")
+
+	// need to get src mac and dst mac
+	//@ToDo host habire aynıysa bunu surekli cagirmak mantikli degil
+	hwaddr, err := getHwAddr(net.ParseIP(host), gateway, net.ParseIP("192.168.1.7"), networkInterface)
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	// Ethernet Header
 	ethLayer := layers.Ethernet{
 		EthernetType: layers.EthernetTypeIPv4,
 		SrcMAC:       net.HardwareAddr{0xa4, 0xcf, 0x99, 0x73, 0x24, 0x55},
-		DstMAC:       net.HardwareAddr{0x14, 0x09, 0xb4, 0xae, 0x32, 0x90}, // burayi gateway'in mac adresi yapmazsan response donmez
+		// DstMAC:       net.HardwareAddr{0x00, 0x0c, 0x29, 0x69, 0xe7, 0xea}, // burayi gateway'in mac adresi yapmazsan response donmez
+		DstMAC: hwaddr,
 	}
 
 	// IP Header
@@ -140,11 +156,84 @@ func createSynPacket(handle *pcap.Handle, host string, port int, rawPort int) (g
 	// create packet
 	buffer := gopacket.NewSerializeBuffer()
 	options := gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}
-	err := gopacket.SerializeLayers(buffer, options, &ethLayer, &ipLayer, &tcpLayer)
+	err = gopacket.SerializeLayers(buffer, options, &ethLayer, &ipLayer, &tcpLayer)
 	if err != nil {
 		return nil, err
 	}
 	return buffer, nil
+}
+
+func getHwAddr(ip net.IP, gateway net.IP, srcIP net.IP, networkInterface *net.Interface) (net.HardwareAddr, error) {
+
+	// grab mac from ARP table if we have it cached
+	macStr := arp.Search(ip.String())
+	if macStr != "00:00:00:00:00:00" {
+		if mac, err := net.ParseMAC(macStr); err == nil {
+			return mac, nil
+		}
+	}
+
+	arpDst := ip
+	if gateway != nil {
+		arpDst = gateway
+	}
+
+	handle, err := pcap.OpenLive(networkInterface.Name, 65536, true, pcap.BlockForever)
+	if err != nil {
+		return nil, err
+	}
+	defer handle.Close()
+
+	start := time.Now()
+
+	// Prepare the layers to send for an ARP request.
+	eth := layers.Ethernet{
+		SrcMAC:       networkInterface.HardwareAddr,
+		DstMAC:       net.HardwareAddr{0xff, 0xff, 0xff, 0xff, 0xff, 0xff},
+		EthernetType: layers.EthernetTypeARP,
+	}
+	arp := layers.ARP{
+		AddrType:          layers.LinkTypeEthernet,
+		Protocol:          layers.EthernetTypeIPv4,
+		HwAddressSize:     6,
+		ProtAddressSize:   4,
+		Operation:         layers.ARPRequest,
+		SourceHwAddress:   []byte(networkInterface.HardwareAddr),
+		SourceProtAddress: []byte(srcIP),
+		DstHwAddress:      []byte{0, 0, 0, 0, 0, 0},
+		DstProtAddress:    []byte(arpDst),
+	}
+
+	buf := gopacket.NewSerializeBuffer()
+
+	// Send a single ARP request packet (we never retry a send, since this
+	options := gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}
+	if err := gopacket.SerializeLayers(buf, options, &eth, &arp); err != nil {
+		return nil, err
+	}
+	if err := handle.WritePacketData(buf.Bytes()); err != nil {
+		return nil, err
+	}
+
+	// Wait 3 seconds for an ARP reply.
+	for {
+		if time.Since(start) > 3*time.Second {
+			return nil, errors.New("timeout getting ARP reply")
+		}
+		data, _, err := handle.ReadPacketData()
+		if err == pcap.NextErrorTimeoutExpired {
+			continue
+		} else if err != nil {
+			return nil, err
+		}
+		packet := gopacket.NewPacket(data, layers.LayerTypeEthernet, gopacket.NoCopy)
+		if arpLayer := packet.Layer(layers.LayerTypeARP); arpLayer != nil {
+			arp := arpLayer.(*layers.ARP)
+			if net.IP(arp.SourceProtAddress).Equal(arpDst) {
+				return net.HardwareAddr(arp.SourceHwAddress), nil
+			}
+		}
+	}
 }
 
 func scanTcp(host string, port int) {
